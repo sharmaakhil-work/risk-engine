@@ -1,0 +1,141 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Position {
+  id            Int      @id @default(autoincrement())
+  symbol        String
+  venue         String
+  qty           Decimal  @default(0) @db.Decimal(38, 18)
+  avgEntryPrice Decimal  @default(0) @map("avg_entry_price") @db.Decimal(38, 18)
+  realizedPnl   Decimal  @default(0) @map("realized_pnl") @db.Decimal(38, 18)
+  marginPosted  Decimal  @default(0) @map("margin_posted") @db.Decimal(38, 18)
+  status        String   @default("OPEN")
+  version       Int      @default(0)
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt     DateTime @map("updated_at") @db.Timestamptz(6)
+
+  @@unique([symbol, venue], map: "positions_symbol_venue_key")
+  @@index([symbol], map: "positions_symbol_idx")
+  @@map("positions")
+}
+
+model Trade {
+  id            Int       @id @default(autoincrement())
+  externalId    String    @map("external_id")
+  venue         String
+  symbol        String
+  side          String
+  qty           Decimal   @db.Decimal(38, 18)
+  price         Decimal   @db.Decimal(38, 18)
+  fee           Decimal   @default(0) @db.Decimal(38, 18)
+  orderId       String?   @map("order_id")
+  isLiquidation Boolean   @default(false) @map("is_liquidation")
+  source        String    @default("stream")
+  tradeTs       DateTime  @map("trade_ts") @db.Timestamptz(6)
+  ingestedAt    DateTime  @default(now()) @map("ingested_at") @db.Timestamptz(6)
+  settledAt     DateTime? @map("settled_at") @db.Timestamptz(6)
+  status        String    @default("RECEIVED")
+
+  @@index([orderId], map: "trades_order_idx")
+  @@index([status], map: "trades_status_idx")
+  @@map("trades")
+}
+
+model LedgerEntry {
+  id             BigInt   @id @default(autoincrement())
+  ts             DateTime @default(now()) @db.Timestamptz(6)
+  account        String
+  kind           String
+  amount         Decimal  @db.Decimal(38, 18)
+  balanceAfter   Decimal  @map("balance_after") @db.Decimal(38, 18)
+  idempotencyKey String?  @map("idempotency_key")
+  tradeId        Int?     @map("trade_id")
+  orderId        String?  @map("order_id")
+  note           String?
+
+  @@index([account, id(sort: Desc)], map: "ledger_account_id_idx")
+  @@index([ts], map: "ledger_ts_idx")
+  @@map("ledger_entries")
+}
+
+model Order {
+  id             String   @id
+  venue          String
+  symbol         String
+  side           String
+  type           String   @default("MARKET")
+  qty            Decimal  @db.Decimal(38, 18)
+  status         String   @default("NEW")
+  marginReserved Decimal  @default(0) @map("margin_reserved") @db.Decimal(38, 18)
+  marginReleased Decimal  @default(0) @map("margin_released") @db.Decimal(38, 18)
+  filledQty      Decimal  @default(0) @map("filled_qty") @db.Decimal(38, 18)
+  avgFillPrice   Decimal  @default(0) @map("avg_fill_price") @db.Decimal(38, 18)
+  isLiquidation  Boolean  @default(false) @map("is_liquidation")
+  failReason     String?  @map("fail_reason")
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt      DateTime @map("updated_at") @db.Timestamptz(6)
+
+  @@index([status], map: "orders_status_idx")
+  @@index([createdAt], map: "orders_created_idx")
+  @@map("orders")
+}
+
+model RiskSnapshot {
+  id                  BigInt   @id @default(autoincrement())
+  ts                  DateTime @default(now()) @db.Timestamptz(6)
+  status              String
+  equity              Decimal  @db.Decimal(38, 18)
+  walletBalance       Decimal  @map("wallet_balance") @db.Decimal(38, 18)
+  marginPosted        Decimal  @map("margin_posted") @db.Decimal(38, 18)
+  loanBalance         Decimal  @map("loan_balance") @db.Decimal(38, 18)
+  unrealizedPnl       Decimal  @map("unrealized_pnl") @db.Decimal(38, 18)
+  realizedPnl         Decimal  @map("realized_pnl") @db.Decimal(38, 18)
+  maintenanceRequired Decimal  @map("maintenance_required") @db.Decimal(38, 18)
+  marginRatio         Decimal? @map("margin_ratio") @db.Decimal(38, 18)
+  var95               Decimal? @db.Decimal(38, 18)
+  var99               Decimal? @db.Decimal(38, 18)
+  es95                Decimal? @db.Decimal(38, 18)
+  grossExposure       Decimal  @map("gross_exposure") @db.Decimal(38, 18)
+  netExposure         Decimal  @map("net_exposure") @db.Decimal(38, 18)
+  marks               Json?
+  detail              Json?
+  workerId            String?  @map("worker_id")
+
+  @@index([ts], map: "risk_snapshots_ts_idx")
+  @@map("risk_snapshots")
+}
+
+model AuditLog {
+  id      BigInt   @id @default(autoincrement())
+  ts      DateTime @default(now()) @db.Timestamptz(6)
+  kind    String
+  subject String?
+  message String
+  data    Json?
+
+  @@index([ts], map: "audit_ts_idx")
+  @@index([kind], map: "audit_kind_idx")
+  @@map("audit_log")
+}
+
+model Price {
+  symbol      String
+  granularity String
+  ts          DateTime @db.Timestamptz(6)
+  open        Decimal  @db.Decimal(38, 18)
+  high        Decimal  @db.Decimal(38, 18)
+  low         Decimal  @db.Decimal(38, 18)
+  close       Decimal  @db.Decimal(38, 18)
+  volume      Decimal  @default(0) @db.Decimal(38, 18)
+  source      String
+
+  @@id([symbol, granularity, ts])
+  @@index([symbol, granularity, ts(sort: Desc)], map: "prices_lookup_idx")
+  @@map("prices")
+}
