@@ -46,7 +46,7 @@ export function parseEvent(id: string, fields: string[]): RiskEvent | null {
   for (let i = 0; i + 1 < fields.length; i += 2) map.set(fields[i]!, fields[i + 1]!);
   const kind = map.get('kind');
   if (!kind) return null;
-  let payload: Record<string, unknown> = {};
+  let payload: Record<string, unknown>;
   try {
     payload = JSON.parse(map.get('payload') ?? '{}') as Record<string, unknown>;
   } catch {

@@ -25,7 +25,7 @@ export type SettleOutcome =
   | { status: 'REJECTED'; reason: string }
   | { status: 'DEFERRED'; reason: string };
 
-interface PositionRow {
+export interface PositionRow {
   id: number;
   qty: Decimal;
   avg_entry_price: Decimal;
@@ -78,7 +78,7 @@ export function parseFillFields(fields: string[]): FillMessage {
   };
 }
 
-interface SettleMath {
+export interface SettleMath {
   newQty: Decimal;
   newAvg: Decimal;
   realized: Decimal;
@@ -109,7 +109,9 @@ function wrapOrderRow(row: OrderRow): OrderRow {
   };
 }
 
-function positionMath(pos: PositionRow, fill: FillMessage): SettleMath {
+// Exported for exhaustive unit testing: this is the branch-dense core of the
+// system (opens, adds, partial closes, full closes, sign crossings).
+export function positionMath(pos: PositionRow, fill: FillMessage): SettleMath {
   const oldQty = pos.qty;
   const oldAvg = pos.avg_entry_price;
   const oldPosted = pos.margin_posted;
@@ -119,7 +121,7 @@ function positionMath(pos: PositionRow, fill: FillMessage): SettleMath {
   let realized = ZERO;
   let postedAdd = ZERO;
   let postedRelease = ZERO;
-  let newAvg = oldAvg;
+  let newAvg: Decimal;
 
   if (oldQty.isZero()) {
     newAvg = fill.price;
@@ -135,8 +137,10 @@ function positionMath(pos: PositionRow, fill: FillMessage): SettleMath {
     if (newQty.isZero()) {
       newAvg = ZERO;
     } else if (newQty.greaterThan(0) === oldQty.greaterThan(0)) {
+      // partially closed, still the same sign: average entry unchanged
       newAvg = oldAvg;
     } else {
+      // crossed zero: the remainder opens a fresh lot at the fill price
       newAvg = fill.price;
       postedAdd = incrementalInitial(ZERO, mul(newQty.abs(), fill.price));
     }

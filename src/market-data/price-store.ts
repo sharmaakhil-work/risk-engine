@@ -5,7 +5,10 @@ import { prisma } from '../db.js';
 import { redis, KEYS, STREAMS } from '../redis.js';
 import { audit } from '../audit.js';
 import { publishEvent } from '../pipeline/event-bus.js';
+import { component } from '../observability/logger.js';
 import { Decimal, normalize, toMoneyString } from '../precision/decimal.js';
+
+const log = component('price-store');
 
 export interface Tick {
   venue: string;
@@ -303,12 +306,12 @@ export class PriceStore {
   startHousekeeping(): void {
     this.timers.push(
       setInterval(() => {
-        void this.flushBars().catch(err => console.error('[price-store] bar flush failed:', err.message));
+        void this.flushBars().catch(err => log.error({ err: err.message }, 'bar flush failed'));
       }, config.barFlushMs),
     );
     this.timers.push(
       setInterval(() => {
-        void this.fallbackTick().catch(err => console.error('[price-store] fallback tick failed:', err.message));
+        void this.fallbackTick().catch(err => log.error({ err: err.message }, 'fallback tick failed'));
       }, 2_000),
     );
   }

@@ -6,6 +6,7 @@ import { config } from '../config.js';
 import type { PortfolioState } from './mark-to-market.js';
 import { placeOrder } from '../positions/exchange-api.js';
 import { Decimal, div, normalize, toMoneyString, ONE } from '../precision/decimal.js';
+import { incMetric } from '../observability/metrics.js';
 import { uid } from '../util.js';
 
 export type RiskAction = 'NONE' | 'OK' | 'WARNED' | 'PAUSED_STALE' | 'LIQUIDATING' | 'IN_DEFICIT';
@@ -98,7 +99,10 @@ export async function evaluateAndAct(
   };
   if (entered || ratio.lessThan(config.marginWarningRatio)) {
     const echo = await redis.set('risk:warn-echo', '1', 'EX', 30, 'NX');
-    if (entered || echo) await publishEvent('margin_warning', warnDetail);
+    if (entered || echo) {
+      await publishEvent('margin_warning', warnDetail);
+      incMetric('risk_engine_margin_warnings_total');
+    }
   }
 
   if (state.equity.isNegative()) {
@@ -141,6 +145,7 @@ export async function evaluateAndAct(
     orders: steps.map(s => ({ symbol: s.symbol, side: s.side, qty: toMoneyString(s.qty) })),
   };
   await publishEvent('liquidation', detail);
+  incMetric('risk_engine_liquidation_rounds_total');
   await audit(
     prisma,
     'LIQUIDATION_ROUND',

@@ -6,6 +6,9 @@ import { parseFillFields, settleFill, fillToFields } from './position-tracker.js
 import { getExchangeOrder } from './exchange-api.js';
 import { ACCOUNTS, appendWithinTx } from './ledger.js';
 import { Decimal, fromDb, toMoneyString, ZERO } from '../precision/decimal.js';
+import { component } from '../observability/logger.js';
+
+const reconLog = component('reconcile');
 
 export interface InvariantCheck {
   name: string;
@@ -30,7 +33,15 @@ const RECONCILER = `reconciler-${process.pid}`;
 async function reclaimPending(stream: string, group: string, settle: boolean): Promise<number> {
   let reclaimed = 0;
   for (;;) {
-    const raw = (await redis.xpending(stream, group, 'IDLE', config.claimMinIdleMs, '-', '+', 25)) as unknown[][];
+    let raw: unknown[][];
+    try {
+      raw = (await redis.xpending(stream, group, 'IDLE', config.claimMinIdleMs, '-', '+', 25)) as unknown[][];
+    } catch (err) {
+      // No consumer group yet (reconcile ran before any worker) — nothing to
+      // reclaim.
+      if (String((err as Error).message).includes('NOGROUP')) return 0;
+      throw err;
+    }
     const ids = raw
       .map(e => (Array.isArray(e) ? String(e[0] ?? '') : ''))
       .filter(id => id && id !== 'null' && id !== '0-0');
@@ -44,7 +55,7 @@ async function reclaimPending(stream: string, group: string, settle: boolean): P
       if (settle) {
         const fill = parseFillFields(fields);
         const outcome = await settleFill(fill);
-        console.log(`[reconcile] reclaimed ${fill.externalId} -> ${outcome.status}`);
+        reconLog.info({ externalId: fill.externalId, outcome: outcome.status }, 'reclaimed message');
       }
       await redis.xack(stream, group, id);
       reclaimed++;

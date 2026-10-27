@@ -13,6 +13,9 @@
     "worker": "tsx src/pipeline/worker.ts",
     "api": "tsx src/api/server.ts",
     "simulate": "tsx scripts/simulate.ts",
+    "test": "tsx scripts/test-db.ts setup && npm run test:run && tsx scripts/test-db.ts teardown",
+    "test:run": "node --import tsx --test --test-concurrency=1 test/*.test.ts",
+    "lint": "eslint .",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
@@ -20,13 +23,17 @@
     "decimal.js": "^10.4.3",
     "fastify": "^5.2.1",
     "ioredis": "^5.6.1",
+    "pino": "^10.3.1",
     "ws": "^8.18.0"
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
     "@types/node": "^24.0.0",
     "@types/ws": "^8.5.12",
+    "eslint": "^10.10.0",
     "prisma": "^6.16.2",
     "tsx": "^4.19.2",
-    "typescript": "^5.6.3"
+    "typescript": "^5.6.3",
+    "typescript-eslint": "^8.70.0"
   }
 }

@@ -25,13 +25,14 @@ export interface VarResult {
 
 const MIN_DAYS = 60;
 
-function quantile(sortedAsc: Decimal[], p: number): Decimal {
+// Exported for unit testing: the pure statistics of the historical method.
+export function quantile(sortedAsc: Decimal[], p: number): Decimal {
   const n = sortedAsc.length;
   const idx = Math.max(0, Math.min(n - 1, Math.floor(p * (n - 1))));
   return sortedAsc[idx]!;
 }
 
-function tailMean(sortedAsc: Decimal[], p: number): Decimal {
+export function tailMean(sortedAsc: Decimal[], p: number): Decimal {
   const n = sortedAsc.length;
   const count = Math.max(1, Math.floor(p * n));
   let acc = ZERO;

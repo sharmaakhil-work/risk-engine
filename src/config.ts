@@ -40,6 +40,17 @@ export const config = {
   marginWarningRatio: 1.4,
   liquidationTargetRatio: 1.5,
 
+  // Production knobs (all optional; defaults keep local development working).
+  apiKey: process.env.API_KEY ?? '',
+  logLevel: process.env.LOG_LEVEL ?? 'info',
+  exchangeAdapter: process.env.EXCHANGE_ADAPTER ?? 'simulated',
+  marginTiersJson: process.env.MARGIN_TIERS ?? '',
+  retention: {
+    snapshotDays: envInt('RETENTION_SNAPSHOT_DAYS', 7),
+    auditDays: envInt('RETENTION_AUDIT_DAYS', 90),
+    minuteBarDays: envInt('RETENTION_MINUTE_BAR_DAYS', 30),
+  },
+
   // Anchors are only used before any history exists (fresh install with
   // exchange feeds unreachable); seed + live feeds override them immediately.
   anchors: {
@@ -49,6 +60,14 @@ export const config = {
     DOGE: '0.16',
   } as Record<string, string>,
 };
+
+function envInt(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return fallback;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 0) throw new Error(`${name} must be a non-negative integer`);
+  return n;
+}
 
 if (!process.env.DATABASE_URL) {
   process.env.DATABASE_URL = config.databaseUrl;

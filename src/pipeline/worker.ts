@@ -8,12 +8,21 @@ import { startCoinbaseFeed } from '../market-data/coinbase-ws.js';
 import { parseFillFields, settleFill } from '../positions/position-tracker.js';
 import { pumpFills } from '../positions/exchange-api.js';
 import { runReconcile } from '../positions/reconcile.js';
+import { runRetention } from './retention.js';
 import { portfolioState } from '../risk/mark-to-market.js';
 import { evaluateAndAct, type RiskAction } from '../risk/liquidation.js';
 import { computeHistoricalVar } from '../risk/var.js';
 import { computeExposure } from '../risk/exposure.js';
 import { toMoneyString, type Decimal } from '../precision/decimal.js';
+import { incMetric, setMetric } from '../observability/metrics.js';
+import { component } from '../observability/logger.js';
 import { uid, sleep } from '../util.js';
+
+const workLog = component('worker');
+const settleLog = component('settlement');
+const riskLog = component('risk');
+const pumpLog = component('pump');
+const reconLog = component('reconcile');
 
 let running = true;
 let shuttingDown = false;
@@ -26,7 +35,9 @@ async function preflight(): Promise<void> {
     throw new Error('database not reachable/migrated — run: npm run db:up');
   }
   const daily = await prisma.price.count({ where: { granularity: '1d' } });
-  if (daily === 0) console.warn('[worker] WARNING: no daily price history — seed first (npm run seed) or VaR stays unavailable');
+  if (daily === 0) {
+    workLog.warn('no daily price history — seed first (npm run seed) or VaR stays unavailable');
+  }
   await pingRedis();
 }
 
@@ -37,23 +48,27 @@ async function handleFill(id: string, fields: string[]): Promise<void> {
     if (outcome.status === 'DEFERRED') {
       // Position row busy in another settler: leave the message pending — the
       // reclaim sweep re-processes it (idempotently) within a claim cycle.
-      console.log(`[settlement] deferred ${fill.externalId} (${outcome.reason})`);
+      settleLog.info({ externalId: fill.externalId, reason: outcome.reason }, 'deferred — left for reclaim');
+      incMetric('risk_engine_settles_total', { result: 'deferred' });
       return;
     }
     await redis.xack(STREAMS.fills, GROUPS.settlers, id);
+    incMetric('risk_engine_settles_total', { result: outcome.status.toLowerCase() });
     if (outcome.status === 'SETTLED') {
-      console.log(
-        `[settlement] settled ${fill.externalId} ${fill.side} ${fill.symbol} qty=${fill.qty.toFixed(6)} @ ${fill.price.toFixed(2)}`,
+      settleLog.info(
+        { externalId: fill.externalId, side: fill.side, symbol: fill.symbol, qty: fill.qty.toFixed(6), price: fill.price.toFixed(2) },
+        'settled',
       );
     } else if (outcome.status === 'DUPLICATE') {
-      console.log(`[settlement] duplicate ${fill.externalId} ignored (audited)`);
+      settleLog.info({ externalId: fill.externalId }, 'duplicate delivery ignored (audited)');
     } else {
-      console.log(`[settlement] rejected ${fill.externalId}: ${outcome.reason}`);
+      settleLog.warn({ externalId: fill.externalId, reason: outcome.reason }, 'rejected');
     }
   } catch (err) {
     // Transient (serialization retries exhausted, connectivity): do NOT ack.
     // The message stays pending and the reclaim sweep settles it later.
-    console.error(`[settlement] error on ${fill.externalId}:`, (err as Error).message);
+    incMetric('risk_engine_settlement_errors_total');
+    settleLog.error({ externalId: fill.externalId, err: (err as Error).message }, 'settlement error — left pending');
   }
 }
 
@@ -76,7 +91,7 @@ async function settlementLoop(): Promise<void> {
         await ensureStreamGroup(STREAMS.fills, GROUPS.settlers);
         continue;
       }
-      console.error('[settlement] loop error:', msg);
+      settleLog.error({ err: msg }, 'consumer loop error');
       await sleep(1000);
     }
   }
@@ -104,7 +119,7 @@ async function riskJobsLoop(): Promise<void> {
         await ensureStreamGroup(STREAMS.riskJobs, GROUPS.evaluators);
         continue;
       }
-      console.error('[risk-jobs] loop error:', msg);
+      riskLog.error({ err: msg }, 'job loop error');
       await sleep(1000);
     }
   }
@@ -123,6 +138,7 @@ function mapStatus(action: RiskAction, hasPositions: boolean): string {
 }
 
 async function evaluateOnce(): Promise<void> {
+  const started = Date.now();
   const state = await portfolioState();
   const { action } = await evaluateAndAct(state);
 
@@ -193,21 +209,37 @@ async function evaluateOnce(): Promise<void> {
     },
   });
   await redis.set(KEYS.workerLastEval, String(Date.now()));
-  console.log(
-    `[risk] ${new Date().toISOString()} status=${status} equity=${state.equity.toFixed(2)} maint=${state.maintenanceRequired.toFixed(2)} ratio=${state.marginRatio ? state.marginRatio.toFixed(3) : 'n/a'} action=${action}`,
+
+  incMetric('risk_engine_risk_evals_total');
+  incMetric('risk_engine_snapshot_rows_written_total');
+  setMetric('risk_engine_risk_eval_duration_ms', Date.now() - started);
+  setMetric('risk_engine_equity_usd', state.equity.toNumber());
+  setMetric('risk_engine_maintenance_required_usd', state.maintenanceRequired.toNumber());
+  setMetric('risk_engine_margin_ratio', state.marginRatio ? state.marginRatio.toNumber() : 0);
+  setMetric('risk_engine_marks_stale', state.staleSymbols.length);
+  riskLog.info(
+    {
+      status,
+      action,
+      equity: state.equity.toFixed(2),
+      maintenance: state.maintenanceRequired.toFixed(2),
+      ratio: state.marginRatio ? state.marginRatio.toFixed(3) : null,
+      durationMs: Date.now() - started,
+    },
+    'risk evaluation',
   );
 }
 
 // Every evaluation is a claimed job on a stream: a timer enqueues ticks, price
-// moves enqueue triggers, workers claim via consumer groups, and a crashed
-// worker's pending jobs are reclaimed by the sweep. Nothing evaluates twice
-// invisibly and nothing is lost on a crash.
+// moves enqueue triggers, workers claim them via consumer groups, and a
+// crashed worker's pending jobs are reclaimed by the sweep. Nothing evaluates
+// twice invisibly and nothing is lost on a crash.
 async function tickLoop(): Promise<void> {
   while (running) {
     try {
       await redis.xadd(STREAMS.riskJobs, 'MAXLEN', '~', '1000', '*', 'type', 'tick');
     } catch (err) {
-      console.error('[tick] error:', (err as Error).message);
+      workLog.error({ err: (err as Error).message }, 'tick enqueue failed');
     }
     await sleep(config.riskEvalIntervalMs);
   }
@@ -223,13 +255,16 @@ async function fillPumpLoop(): Promise<void> {
       if (await tryLock(KEYS.fillPumpLock, token, Math.max(2000, config.fillPumpIntervalMs * 2))) {
         try {
           const n = await pumpFills();
-          if (n > 0) console.log(`[pump] published ${n} fill(s)`);
+          if (n > 0) {
+            incMetric('risk_engine_fills_published_total', n);
+            pumpLog.info({ fills: n }, 'published fills');
+          }
         } finally {
           await releaseLock(KEYS.fillPumpLock, token);
         }
       }
     } catch (err) {
-      console.error('[pump] error:', (err as Error).message);
+      pumpLog.error({ err: (err as Error).message }, 'pump error');
     }
     await sleep(config.fillPumpIntervalMs);
   }
@@ -241,33 +276,55 @@ async function reconcileLoop(): Promise<void> {
     if (!running) break;
     try {
       const report = await runReconcile();
-      const parts: string[] = [];
-      if (report.reclaimed) parts.push(`reclaimed=${report.reclaimed}`);
-      if (report.recoveredFills) parts.push(`recoveredFills=${report.recoveredFills}`);
-      if (report.stuckOrdersFixed) parts.push(`stuckFixed=${report.stuckOrdersFixed}`);
-      if (report.releasedReservations.length) parts.push(`reservationsReleased=${report.releasedReservations.length}`);
+      incMetric('risk_engine_reclaimed_total', report.reclaimed);
+      incMetric('risk_engine_recovered_fills_total', report.recoveredFills);
+      incMetric('risk_engine_stuck_orders_fixed_total', report.stuckOrdersFixed);
       const failed = report.checks.filter(c => !c.ok).length;
-      parts.push(`invariants=${failed === 0 ? 'PASS' : `${failed} FAIL`}`);
-      console.log(`[reconcile] ${parts.join(' ')}`);
+      if (failed > 0) incMetric('risk_engine_invariant_failures_total', failed);
+      reconLog.info(
+        {
+          reclaimed: report.reclaimed || undefined,
+          recoveredFills: report.recoveredFills || undefined,
+          stuckFixed: report.stuckOrdersFixed || undefined,
+          reservationsReleased: report.releasedReservations.length || undefined,
+          invariants: failed === 0 ? 'PASS' : `${failed} FAIL`,
+        },
+        'reconcile sweep',
+      );
     } catch (err) {
-      console.error('[reconcile] error:', (err as Error).message);
+      reconLog.error({ err: (err as Error).message }, 'reconcile error');
+    }
+  }
+}
+
+async function retentionLoop(): Promise<void> {
+  // Hourly is plenty: retention is hygiene, not correctness.
+  while (running) {
+    await sleep(3_600_000);
+    if (!running) break;
+    try {
+      await runRetention();
+    } catch (err) {
+      workLog.error({ err: (err as Error).message }, 'retention error');
     }
   }
 }
 
 async function heartbeatLoop(): Promise<void> {
+  const startedAt = Date.now();
   while (running) {
     try {
       await redis.set(KEYS.workerHeartbeat, `worker-${process.pid}`, 'EX', 15);
+      setMetric('risk_engine_process_uptime_seconds', Math.round((Date.now() - startedAt) / 1000));
     } catch (err) {
-      console.error('[heartbeat] error:', (err as Error).message);
+      workLog.error({ err: (err as Error).message }, 'heartbeat error');
     }
     await sleep(5_000);
   }
 }
 
 async function main(): Promise<void> {
-  console.log(`[worker] starting (pid ${process.pid})`);
+  workLog.info({ pid: process.pid }, 'worker starting');
   await preflight();
   await priceStore.loadHistoryAnchors();
   priceStore.startHousekeeping();
@@ -283,15 +340,17 @@ async function main(): Promise<void> {
   void reconcileLoop();
   void heartbeatLoop();
   void tickLoop();
-  console.log(
-    '[worker] running — feeds: binance + coinbase (synthetic fallback if unreachable), loops: settlement, risk-eval, fill pump, reconcile, heartbeat',
+  void retentionLoop();
+  workLog.info(
+    { feeds: ['binance', 'coinbase'], loops: ['settlement', 'risk-eval', 'fill-pump', 'reconcile', 'retention', 'heartbeat'] },
+    'worker running',
   );
 }
 
 async function shutdown(signal: string): Promise<void> {
   if (shuttingDown) return;
   shuttingDown = true;
-  console.log(`[worker] ${signal} received — shutting down`);
+  workLog.info({ signal }, 'shutting down');
   running = false;
   for (const f of feeds) f.stop();
   priceStore.stopHousekeeping();
@@ -303,9 +362,9 @@ async function shutdown(signal: string): Promise<void> {
 
 process.on('SIGINT', () => void shutdown('SIGINT'));
 process.on('SIGTERM', () => void shutdown('SIGTERM'));
-process.on('unhandledRejection', err => console.error('[worker] unhandled rejection:', err));
+process.on('unhandledRejection', err => workLog.error({ err: String(err) }, 'unhandled rejection'));
 
 main().catch(err => {
-  console.error('[worker] fatal:', err);
+  workLog.error({ err: (err as Error).stack ?? String(err) }, 'fatal');
   process.exit(1);
 });

@@ -3,8 +3,17 @@ import { pingDb, prisma } from '../db.js';
 import { redis, pingRedis, KEYS } from '../redis.js';
 import { priceStore } from '../market-data/price-store.js';
 import { toMoneyString } from '../precision/decimal.js';
+import { renderMetrics } from '../observability/metrics.js';
 
 export async function registerHealthRoutes(app: FastifyInstance): Promise<void> {
+  app.get('/metrics', async (_request, reply) => {
+    // Prometheus text format; protected by the same auth as business routes
+    // (scrapers pass the API key).
+    return reply
+      .type('text/plain; version=0.0.4; charset=utf-8')
+      .send(renderMetrics({ risk_engine_process_uptime_seconds: Math.round(process.uptime()) }));
+  });
+
   app.get('/health', async () => {
     const started = Date.now();
     let postgres = 'ok';

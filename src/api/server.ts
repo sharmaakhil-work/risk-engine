@@ -1,15 +1,20 @@
-import Fastify, { type FastifyInstance } from 'fastify';
+import Fastify from 'fastify';
 import { config } from '../config.js';
 import { redis } from '../redis.js';
 import { RateLimiter, RateLimitedError } from '../market-data/rate-limiter.js';
 import { ExchangeError, InsufficientFundsError, StaleMarketError, UnknownSymbolError } from '../positions/exchange-api.js';
 import { toMoneyString } from '../precision/decimal.js';
+import { log } from '../observability/logger.js';
+import { registerAuth } from './auth.js';
 import { registerHealthRoutes } from './health.js';
 import { registerPortfolioRoutes } from './positions.js';
 import { registerRiskRoutes } from './risk.js';
 
-const app = Fastify({ logger: false });
+const app = Fastify({ logger: log });
 const apiLimiter = new RateLimiter(redis, { capacity: 50, refillPerSec: 10 });
+
+// Auth first (401 before 429), then the per-client rate limit.
+registerAuth(app);
 
 app.addHook('preHandler', async (request, reply) => {
   const decision = await apiLimiter.check(`api:${request.ip}`);
@@ -41,7 +46,7 @@ app.setErrorHandler((err: unknown, _request, reply) => {
   if (typeof statusCode === 'number' && statusCode >= 400 && statusCode < 500) {
     return reply.code(statusCode).send({ error: e.message });
   }
-  console.error('[api] unhandled error:', err);
+  log.error({ err: e.stack ?? String(err) }, 'unhandled request error');
   return reply.code(500).send({ error: 'internal error' });
 });
 
@@ -50,7 +55,7 @@ async function start(): Promise<void> {
   await registerPortfolioRoutes(app);
   await registerRiskRoutes(app);
   await app.listen({ port: config.apiPort, host: '127.0.0.1' });
-  console.log(`[api] listening on http://127.0.0.1:${config.apiPort}`);
+  log.info({ url: `http://127.0.0.1:${config.apiPort}`, auth: Boolean(config.apiKey) }, 'api listening');
   for (const signal of ['SIGINT', 'SIGTERM'] as const) {
     process.on(signal, () => {
       void app.close().then(() => process.exit(0));
@@ -59,6 +64,6 @@ async function start(): Promise<void> {
 }
 
 start().catch(err => {
-  console.error('[api] fatal:', err);
+  log.error({ err: (err as Error).stack ?? String(err) }, 'api fatal');
   process.exit(1);
 });
